@@ -38,6 +38,7 @@ require (
 	go.opencensus.io v0.22.5
 	go.opentelemetry.io/otel v0.13.0
 	go.uber.org/atomic v1.6.0
+	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
 	google.golang.org/genproto v0.0.0-20201204160425-06b3db808446
 	google.golang.org/grpc v1.34.0
 	google.golang.org/protobuf v1.25.0

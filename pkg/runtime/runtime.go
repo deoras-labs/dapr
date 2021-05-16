@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	nethttp "net/http"
 
 	"contrib.go.opencensus.io/exporter/zipkin"
@@ -191,7 +193,7 @@ func NewDaprRuntime(runtimeConfig *Config, globalConfig *config.Configuration, a
 }
 
 // Run performs initialization of the runtime with the runtime and global configurations
-func (a *DaprRuntime) Run(opts ...Option) error {
+func (a *DaprRuntime) Run(ctx context.Context, opts ...Option) (error, context.Context) {
 	start := time.Now().UTC()
 	log.Infof("%s mode configured", a.runtimeConfig.Mode)
 	log.Infof("app id: %s", a.runtimeConfig.ID)
@@ -201,9 +203,10 @@ func (a *DaprRuntime) Run(opts ...Option) error {
 		opt(&o)
 	}
 
-	err := a.initRuntime(&o)
+	var err error
+	err, ctx = a.initRuntime(ctx, &o)
 	if err != nil {
-		return err
+		return err, ctx
 	}
 
 	d := time.Since(start).Seconds() * 1000
@@ -214,7 +217,7 @@ func (a *DaprRuntime) Run(opts ...Option) error {
 		a.daprHTTPAPI.MarkStatusAsReady()
 	}
 
-	return nil
+	return nil, ctx
 }
 
 func (a *DaprRuntime) getNamespace() string {
@@ -253,7 +256,7 @@ func (a *DaprRuntime) setupTracing(hostAddress string, exporters traceExporterSt
 	return nil
 }
 
-func (a *DaprRuntime) initRuntime(opts *runtimeOpts) error {
+func (a *DaprRuntime) initRuntime(ctx context.Context, opts *runtimeOpts) (error, context.Context) {
 	// Initialize metrics only if MetricSpec is enabled.
 	if a.globalConfig.Spec.MetricSpec.Enabled {
 		if err := diag.InitMetrics(a.runtimeConfig.ID); err != nil {
@@ -263,19 +266,19 @@ func (a *DaprRuntime) initRuntime(opts *runtimeOpts) error {
 
 	err := a.establishSecurity(a.runtimeConfig.SentryServiceAddress)
 	if err != nil {
-		return err
+		return err, ctx
 	}
 	a.namespace = a.getNamespace()
 	a.operatorClient, err = a.getOperatorClient()
 	if err != nil {
-		return err
+		return err, ctx
 	}
 
 	if a.hostAddress, err = utils.GetHostAddress(); err != nil {
-		return errors.Wrap(err, "failed to determine host address")
+		return errors.Wrap(err, "failed to determine host address"), ctx
 	}
 	if err = a.setupTracing(a.hostAddress, openCensusExporterStore{}); err != nil {
-		return errors.Wrap(err, "failed to setup tracing")
+		return errors.Wrap(err, "failed to setup tracing"), ctx
 	}
 	// Register and initialize name resolution for service discovery.
 	a.nameResolutionRegistry.Register(opts.nameResolutions...)
@@ -292,7 +295,7 @@ func (a *DaprRuntime) initRuntime(opts *runtimeOpts) error {
 	a.httpMiddlewareRegistry.Register(opts.httpMiddleware...)
 
 	go a.processComponents()
-	err = a.beginComponentsUpdates()
+	err, ctx = a.beginComponentsUpdates(ctx)
 	if err != nil {
 		log.Warnf("failed to watch component updates: %s", err)
 	}
@@ -360,7 +363,7 @@ func (a *DaprRuntime) initRuntime(opts *runtimeOpts) error {
 	if err != nil {
 		log.Warnf("failed to read from bindings: %s ", err)
 	}
-	return nil
+	return nil, ctx
 }
 
 func (a *DaprRuntime) populateSecretsConfiguration() {
@@ -468,42 +471,46 @@ func (a *DaprRuntime) initDirectMessaging(resolver nr.Resolver) {
 		a.runtimeConfig.MaxRequestBodySize)
 }
 
-func (a *DaprRuntime) beginComponentsUpdates() error {
+func (a *DaprRuntime) beginComponentsUpdates(ctx context.Context) (error, context.Context) {
 	if a.runtimeConfig.Mode != modes.KubernetesMode {
-		return nil
+		return nil, ctx
 	}
 
-	go func() {
-		stream, err := a.operatorClient.ComponentUpdate(context.Background(), &emptypb.Empty{})
-		if err != nil {
-			log.Errorf("xyz error from operator stream: %s", err)
-			return
-		}
-		for {
-			c, err := stream.Recv()
+	eg, ctx := errgroup.WithContext(ctx)
+
+	eg.Go(
+		func() error {
+			stream, err := a.operatorClient.ComponentUpdate(context.Background(), &emptypb.Empty{})
 			if err != nil {
-				log.Errorf("pqr error from operator stream: %s", err)
-				return
+				log.Errorf("error from operator stream: %s", err)
+				return err
 			}
+			for {
+				c, err := stream.Recv()
+				if err != nil {
+					log.Errorf("error from operator stream: %s", err)
+					return err
+				}
 
-			var component components_v1alpha1.Component
-			err = json.Unmarshal(c.GetComponent(), &component)
-			if err != nil {
-				log.Warnf("error deserializing component: %s", err)
-				continue
+				var component components_v1alpha1.Component
+				err = json.Unmarshal(c.GetComponent(), &component)
+				if err != nil {
+					log.Warnf("error deserializing component: %s", err)
+					continue
+				}
+
+				authorized := a.isComponentAuthorized(component)
+				if !authorized {
+					log.Debugf("received unauthorized component update, ignored. name: %s, type: %s/%s", component.ObjectMeta.Name, component.Spec.Type, component.Spec.Version)
+					continue
+				}
+
+				log.Debugf("received component update. name: %s, type: %s/%s", component.ObjectMeta.Name, component.Spec.Type, component.Spec.Version)
+				a.onComponentUpdated(component)
 			}
-
-			authorized := a.isComponentAuthorized(component)
-			if !authorized {
-				log.Debugf("received unauthorized component update, ignored. name: %s, type: %s/%s", component.ObjectMeta.Name, component.Spec.Type, component.Spec.Version)
-				continue
-			}
-
-			log.Debugf("received component update. name: %s, type: %s/%s", component.ObjectMeta.Name, component.Spec.Type, component.Spec.Version)
-			a.onComponentUpdated(component)
-		}
-	}()
-	return nil
+		},
+	)
+	return nil, ctx
 }
 
 func (a *DaprRuntime) onComponentUpdated(component components_v1alpha1.Component) {

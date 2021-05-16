@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"strings"
@@ -126,12 +127,14 @@ var (
 )
 
 func main() {
+	ctx := context.Background()
 	rt, err := runtime.FromFlags()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = rt.Run(
+	err, ctx = rt.Run(
+		ctx,
 		runtime.WithSecretStores(
 			secretstores_loader.New("kubernetes", func() secretstores.SecretStore {
 				return sercetstores_kubernetes.NewKubernetesSecretStore(logContrib)
@@ -432,6 +435,12 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
-	<-stop
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		log.Fatalf("fatal error from runtime: %s", err)
+	case <-stop:
+	}
+
 	rt.ShutdownWithWait()
 }
